@@ -1,5 +1,7 @@
 This code repository is for the modeling framework developed by work package 2 of the BEPREP project.
-NOTE: data is not provided in this repository at this time. Unless otherwise stated the code in this project is in R.
+
+NOTES: data is not provided in this repository at this time.
+Unless otherwise stated the code in this project is in R.
 
 The initial deliverable outlining the process can be found in the position folder in LaTeX format.
 
