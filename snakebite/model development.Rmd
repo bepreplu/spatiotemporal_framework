@@ -6,419 +6,564 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(plotly)
+library(astsa)
+library(sf)
+library(reshape2)
+library(gridExtra)
+library(transformr)
+sf_use_s2(FALSE)
 source("../../../utils/R/utils.R")
 install()
-installKaleido(full=F)
-source("helpers.R")
-
-
 library(inlabru)
-isTRUE(getOption("knitr.in.progress"))
-knitr::opts_chunk$set(echo = TRUE)
+
+# helper functions - project wide
+source("./helpers.R")
 ```
 
-# Preliminary Factors
 
-```{r}
-m = options()
-cireps = 10000
-overwrite = FALSE # regenerate all the slow parts from scratch
-defaultSaveFolder=cacheFolder # covariates will save to cache
+load data
 
-# Definitions
-dataFolder = "../data"
-swedenFolder = "../../Sweden"
-outFolder = "../paperoutputs"
+```{r include=FALSE}
+# define our spatio-temporal coordinates
+tcols = c("year", "month")
+scols = c("GID_1")
+scolsn = c("gid")
 
-tcols = c("year","month")
-scols = c("long","lat")
-tcol = c("ym")
-scol = c("gid")
-# model covariates
-covariates = c("temperature", "snowflux", "humidity", "rain")
+# load the country geo data
+regions = st_read("../../Brazil/Brazil_1.json")
+regions$gid = regionNumber(regions$GID_1)
 
-# load the data
-hanta = read.csv(path("clean", folder=dataFolder, extension=".csv"))[,-1]
-sweden = decache("sweden")
+regions = sfsuspend(regions)
+regions = sortdf(regions, scolsn)
+regions = sfresume(regions)
 
-# basic metrics - NOT SPARSE
-ntimes = nrow(unique(select(hanta, all_of(tcols))))
-nlocs = nrow(unique(select(hanta, all_of(scols))))
+# load the baseline data - already sorted by time, then space
+snakebites = read.csv(paste(dataFolder,"cleanscaled.csv",sep="/"))[,-1]
 
-# augment the data - move this to the preprocess script
-hanta = uIndex(hanta, tcols, newColName="ym")
-hanta = uIndex(hanta, scols, newColName="gid")
+# reorder using space first to make copying geometry easy
+snakebites = sortdf(snakebites, c(scolsn,tcols))
 
-# make iuIndex()# make into a simple feature
-hanta = tosf(hanta, coords=scols)
+# note the metrics of the data
+times = unique(select(snakebites, tcols))
+ntimes = nrow(times)
+locs = unique(select(snakebites, scols))
+locs = applyLookupv(locs, "GID_1", regions, colsToTransfer=c("NAME_1"))
+locs$gid = regionNumber(locs$GID_1)
+locs = sortdf(locs, "gid")
+nlocs = nrow(locs)
 
-# add in lat long too
-coords = st_coordinates(hanta)
-hanta$long = coords[,1]
-hanta$lat = coords[,2]
+# load the adjacency matrix
+adj = readRDS(path("adjacency", folder=dataFolder, extension="rds"))
 
 
-# to avoid changing the original data, take a copy that is ordered by time then space
-copy = function(df){
-  dfcopy = NULL
-  sortkey = c(tcols,scols)
-  if("sf" %in% class(df)){
-    dfcopy = sfinject(df, sortdf, sortkey)
-  } else{
-    dfcopy = sortdf(df, sortkey)
-  }
-  return(dfcopy)
+# Helpers
+
+linmod = function(lmform, data){
+  linfit = bru(lmform, family="poisson", data=data,
+           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                        control.inla = list(int.strategy = "eb"),
+                        verbose = F))
+  linfit$residuals = linfit$residuals$deviance.residuals
+  return(linfit)
 }
 
-# call this to refresh the sorting on the hanta data
-hantasort = function(){
-  sortkey = c(tcols,scols)
-  if("sf" %in% class(hanta)){
-    hanta <<- sfinject(hanta, sortdf, sortkey)
-  } else{
-    hanta <<- sortdf(hanta, sortkey)
-  }
+baseform = cases ~ temperature + humidity + rain
+covonly = linmod(baseform, data=snakebites)
+covonlyresid = covonly$residuals
+```
+
+# Initial covariate model - whole country
+
+```{r}
+acfallcases = ggacf(snakebites$cases) + ggtitle("ACF plot of all snakebites.")
+acfallresids = ggacf(covonlyresid) + ggtitle("ACF plot of initial model's residuals, fit to all snakebites.")
+
+plot(acfallcases)
+plot(acfallresids)
+
+saveimg(acfallcases)
+saveimg(acfallresids)
+```
+
+
+## Initial covariate model - per region
+```{r}
+regionNum = 5
+regplots = checkRegion(regionNum)
+regmap = plotRegion(regions, locs$NAME_1[regionNum], "NAME_1")
+plot(regmap)
+
+regcases = regplots$caseplt
+regacfcases = regplots$caseacfplt
+regacfresid = regplots$residacfplt
+
+
+saveimg(regmap)
+saveimg(regcases)
+saveimg(regacfcases)
+saveimg(regacfresid)
+
+tabregionuv = data.frame(Cases=regplots$before, Residuals=regplots$after)
+tabregionuv$improvement = tabregionuv$Cases - tabregionuv$Residuals
+
+savetbl(tabregionuv, paste("Unexplained autocorrelation in Region",regionNum,""))
+```
+
+## Apply an autocorrelation test to all regions
+
+```{r}
+## TODO: check that acfUV is same as using new inside outside functions, may be better vectorised.
+
+region = c()
+before = c()
+after = c()
+for(r in 1:nlocs){
+  reg = filter(snakebites, gid==r)
+  covlm = linmod(baseform, data=reg)
+  covresid = covlm$residuals
+  
+  caseuv = acfUV(reg$cases)
+  residuv = acfUV(covresid)
+  
+  region = c(region, locs[r,2])
+  before = c(before, caseuv)
+  after = c(after, residuv)
 }
-hantasort()
+
+covlmUV = data.frame(region, observed=before, residuals=after)
+covlmUV$improvement = before - after
+covlmUV
+savetbl(covlmUV, "Unexplained variance in the observed cases, and in the residuals from the initial linear model.")
 ```
 
-## EDA
-
+There are some values which are not well explained by the covariate only model.
 ```{r}
-o = overview(sfsuspend(hanta))
+covlmUV[covlmUV$residuals > covlmUV$observed,]
+
+threshold = .2
+
+covlmUVworst = covlmUV[covlmUV$improvement < threshold,]
+covlmUVworst
+savetbl(covlmUVworst, caption="Regions where the initial model performed worst.")
 ```
 
+Conclude that covariates only do not capture all of the variance in all regions.
+Suggested improvement - add seasonal term
+
+## Best covariate combination - performance
+
+# Projections
 ```{r}
-shanta = groupSummary(hanta, groupBy = scols, summariseBy = c(covariates, "cases"))
-thanta = groupSummary(hanta, groupBy = c(tcols,tcol), summariseBy = c(covariates, "cases"))
+measurePredictivePower = function(df, covariates, splitYear, showGraphs=FALSE){
+  combinations = comboList(covariates)
 
-years = unique(thanta$year)
-casestime = ggplot(thanta) +
-  geom_line(aes(x=ym, y=cases), color="steelblue3") +
-  scale_x_continuous(breaks=seq(1,(max(thanta$ym)),by=12), labels=as.character(unique(thanta$year))) +
-  xlab("date") +
-  theme_bw()
+  splitAt = firstGTE(df, "year", splitYear) - 1
+  split = splitdf(df, splitAt)
+  
+  perfstat = c()
+  for(covs in combinations){
+    # make the formula up for each combination of covariates
+    hascovs = sum(covs != "") > 0
+    lmformula = cases~Intercept(1)
+    
+    if(hascovs){
+      lmformula = form(covariates=c("Intercept(1)",covs))
+    }
+    
+    lmfit = bru(lmformula, family="poisson", data=split$before,
+           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                        control.inla = list(int.strategy = "eb"),
+                        verbose = F))
+    
+    preds = exp(predict(lmfit, newdata=split$after, formula=cleanFormula(lmformula), n.samples=100)$mean)
+    
+    # measure the performance - rmse
+    actual = split$after$cases
+    err = actual - preds
+    rmse = sqrt(mean(err*err))
+    
+    if(showGraphs){
+      print(ggplotly(ggplot() +
+      #geom_line(data=split$before, mapping=aes(x=1:splitAt,y=cases,colour="before")) +
+      geom_line(data=split$after, mapping=aes(x=(splitAt+1):nrow(df),y=cases,colour="after")) +
+      geom_line(mapping=aes(x=(splitAt+1):nrow(df),y=preds,colour="predicted")) +
+      xlab("Held Out Months") +
+      ylab("RMSE") +
+      ggtitle(paste(covs)) + 
+      theme_bw()))
+    }
+    
+    # add to the pile
+    perfstat = c(perfstat, rmse)
+  }
 
-casesspace = ggplot(sweden) + 
-  geom_sf() +
-  geom_point(aes(x=long, y=lat, colour=cases, size=log(cases)), alpha=0.5, data=shanta) +
-  theme_bw() 
-
-ggplotly(casestime)
-ggplotly(casesspace)
-casesspace
-
-saveimg(plt=casestime)
-saveimg(plt=casesspace)
+ return(perfstat)
+}
 ```
 
+
+Split the data set - fit to past - project future - compare
 ```{r}
-# Here space and time datasets are summarised by sum. Mean will be used for residuals
-casov = loadOrGenerate("casesOverview", func=function(){
-    sto = stoverview(hanta, spaceCols=scol, timeCols=tcol, ciReps=cireps)
-    sto$stvario = STvarioplot(hanta, cases~1, cireps=cireps)
-    return(sto)
-  }, overwrite=overwrite)
-
-casesvario = casov$vario
-casesacf = casov$acf
-casesstvario = casov$stvario
-
-casesvario
-casesacf
-casesstvario
-
-saveimg(casesvario)
-saveimg(casesacf)
-saveimg(casesstvario)
-
-casesstvario
-```
-
-
-## Covariate selection
-
-
-```{r}
-combinations = comboList(c("temperature","humidity","rain","snowflux"))
+df = snakebites
+covlist = c("temperature","humidity","rain")
+combinations = comboList(covlist)
 comboString = comboListStrings(combinations)
 
-splitAt = firstGTE(hanta, "year", 2015) - 1
-split = splitdf(dropSF(hanta), splitAt)
-
-perfstat = c()
-for(covs in combinations){
-  print(covs)
-  # make the formula up for each combination of covariates
-  hascovs = sum(covs != "") > 0
-  #print(hascovs)
-  lmformula = cases~Intercept(1)
+covperflist = list()
+bestIndexes = c()
+for(i in 1:nlocs){
+  reg = locs$GID_1[i]
+  print(reg)
   
-  if(hascovs){
-    lmformula = form(covariates=c("Intercept(1)",covs))
-  }
-  
-  #print(lmformula)
-  lmfit = bru(lmformula, family="poisson", data=split$before,
-         options=list(control.compute = list(waic = TRUE, cpo = FALSE),
-                      control.inla = list(int.strategy = "eb"),
-                      verbose = F))
-  
-  preds = exp(predict(lmfit, newdata=split$after, formula=baseform(lmformula), n.samples=1000)$mean)
-  print(ggplotly(ggplot() +
-    #geom_line(data=split$before, mapping=aes(x=1:splitAt,y=cases,colour="before")) +
-    geom_line(data=split$after, mapping=aes(x=(splitAt+1):nrow(hanta),y=cases,colour="after")) +
-    geom_line(mapping=aes(x=(splitAt+1):nrow(hanta),y=preds,colour="predicted")) +
-    theme_bw()))
-  
-  # dpois - gen cases
-
-  
-  # measure the performance - rmse
-  actual = split$after$cases
-  err = actual - preds
-  rmse = sqrt(mean(err*err))
-  
-  # or use variogram
-  perfstat = c(perfstat, rmse)
+  regdata = filter(snakebites, GID_1 == reg)
+  perfmetric = measurePredictivePower(regdata, covlist, 2018)
+  covperflist[[reg]] = perfmetric
+  # note the best (lowest)
+  bestIndex = which(perfmetric == min(perfmetric))
+  bestIndexes = c(bestIndexes, bestIndex)
 }
 
-covpredperf = data.frame("covariates"=comboString, "RMSE"=perfstat)
-savetbl(covpredperf, caption="RMSE for each covariate combination when projecting 2016 onwards")
+
+covpredperf = data.frame(covperflist)
+covpredperf$covariates = comboString
+
+
+bestcovpred = data.frame("Region"=locs$NAME_1, "Covariates"=covpredperf$covariates[bestIndexes])
+
+savetbl(covpredperf)
+savetbl(bestcovpred)
+
+# get the best per region combo in list format for later use
+bestByNum = combinations[bestIndexes]
+best = list()
+for(i in 1:nlocs){
+    reg = locs$GID_1[i]
+    best[reg] = bestByNum[i] 
+}
+
 ```
 
 
+2 points to make: Different covariates perform differently per region.
+                  Region 8 performs best with no model (intercept only) - issues with reporting after certain date
 
-# Initial Model - covariates only
 
 
-## Propose
+
+# Iteration 1 complete - improvements identified (add temporal term, vary covariate combinations)
+
+
+
+
+# Adding temporal term
+
 
 ```{r}
-initial = form(covariates=covariates)
-lmfit = bru(initial, family="poisson", data=copy(hanta),
-           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
-                        control.inla = list(int.strategy = "eb"),
-                        verbose = F))
 
-summary(lmfit)
+# calculate the before and after - performance check. did things improve
+sarlmimprove = performance(snakebites, locs$GID_1, c("lmse","smse","diff"), 
+              metric = function(reg, regdata){
+                # get the best linear model setup
+                bestCovs = best[[reg]]
+                # fit sarima and linear models for comparison
+                sfit = fitSarima(regdata, NULL, covariates=bestCovs, showPlot=FALSE)
+                lmfit = linmod(form(covariates=bestCovs), data=regdata)
+                # work out the mse and improvement, then output as the next row
+                smse = MSE(sfit$resid)
+                lmse = MSE(lmfit$residuals)
+                diff = lmse - smse
+                return(c(lmse,smse,diff))
+              }) # yes, big improvements across the board. almost unbelievable. check again to be sure
+savetbl(regionRename(sarlmimprove), tblname="sarlmimprove", "Table showing the MSE of the rediduals of a linear model of covariates with and without a temporal SARIMA term")
+
+# select inadequate regions to have an additional AR1 term - look for unexplained t var
+sarlmacfchange = performance(snakebites, locs$GID_1, c("initial","sarima","diff"), 
+              metric = function(reg, regdata){
+                # get the best linear model setup
+                bestCovs = best[[reg]]
+                # fit sarima and linear models for comparison
+                sfit = fitSarima(regdata, NULL, covariates=bestCovs, showPlot=FALSE)
+                lmfit = linmod(form(covariates=bestCovs), data=regdata)
+                # work out the UV and improvement, then output as the next row
+                sm = acfUV(sfit$resid)
+                lm = acfUV(lmfit$residuals)
+                return(c(lm, sm, lm-sm))
+              })
+savetbl(regionRename(sarlmacfchange), tblname="sarlmacfchange", "Table showing the unexplained temporal variance of the residuals from a linear model of covariates, as well as a SARIMA model.")
+needAR = filter(sarlmacfchange, sarima >= threshold)$region
+
+# fit again with ar1 and sarima for those regions
+
+# check performance increase of those regions over sarima fit
+arimprove = performance(snakebites, locs$GID_1, c("sarima","sarimaAR","diff"), 
+              metric = function(reg, regdata){
+                # get the best linear model setup
+                bestCovs = best[[reg]]
+                # fit sarima and linear models for comparison
+                noar = fitSarima(regdata, NULL, addAR1=F, covariates=bestCovs, showPlot=F)
+                ar = fitSarima(regdata, NULL, addAR1=T, covariates=bestCovs, showPlot=F)
+                # work out the mse and improvement, then output as the next row
+                smse = MSE(noar$resid)
+                armse = MSE(ar$resid)
+                diff = smse - armse
+                row = c(smse,armse,diff)
+                info(c(reg,row))
+                return(row)
+              }) 
+arimprove # always an improvement to include the ar1 term. negligable in a number of regions though
+savetbl(regionRename(arimprove), tblname="arimprove", "Table showing the MSE in residuals from a SARIMA (0,0,0)(1,0,0)12 model against a SARIMA (1,0,0)(1,0,0)12, as well as the difference.")
+
+# check performance increase of those regions over sarima fit
+arimproveuv = performance(snakebites, locs$GID_1, c("sarima","sarimaAR","diff"), 
+              metric = function(reg, regdata){
+                # get the best linear model setup
+                bestCovs = best[[reg]]
+                # fit sarima and linear models for comparison
+                noar = fitSarima(regdata, NULL, addAR1=F, covariates=bestCovs, showPlot=F)
+                ar = fitSarima(regdata, NULL, addAR1=T, covariates=bestCovs, showPlot=F)
+                # work out the mse and improvement, then output as the next row
+                smse = acfUV(noar$resid)
+                armse = acfUV(ar$resid)
+                diff = smse - armse
+                row = c(smse,armse,diff)
+                info(c(reg,row))
+                return(row)
+              }) 
+arimproveuv # always an improvement to include the ar1 term. negligable in a number of regions though
+savetbl(regionRename(arimproveuv), tblname="arimproveuv", "Table showing the unexplained variance in residuals from a SARIMA (0,0,0)(1,0,0)12 model against a SARIMA (1,0,0)(1,0,0)12, as well as the difference.")
 ```
 
+# Sarima performance check - residuals still have temporal pattern?
 ```{r}
-hanta$lmresid = getModelResiduals(lmfit)
+arsaracf = performance(snakebites, locs$GID_1, c("unexplained autocorrelation"), 
+              metric = function(reg, regdata){
+                # get the best covariates to use
+                bestCovs = best[[reg]]
+                # fit best model
+                ar = fitSarima(regdata, NULL, addAR1=T, covariates=bestCovs, showPlot=F)
+                # work out the mse and improvement, then output as the next row
+                uv = acfUV(ar$resid)
+                return(uv)
+              }) 
+arsaracf 
+```
 
-lmresidO = loadOrGenerate("lmoverview", func=function(){
-    stov = stoverview(hanta, form=lmresid~1, ciReps=cireps, 
-                      spaceCols=scol, timeCols=tcol,
-                      spaceSummaryFunction=mean, timeSummaryFunction=mean)
-    stov$stvario = STvarioplot(hanta, lmresid~1, cireps=cireps)
-    return(stov)
-  }, overwrite=overwrite)
-
-lmvario = lmresidO$vario
-lmacf = lmresidO$acf
-lmstvario = lmresidO$stvario
-lmresid = plotResids(hanta, "lmresid")
-
-lmvario
-lmacf
-lmstvario
-lmresid
-
-saveimg(lmvario)
-saveimg(lmacf)
-saveimg(lmstvario)
-saveimg(lmresid)
+# get all of the models by region of each type with best covariates
+```{r, echo=FALSE, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+allfits = colmetric(snakebites, scols, 
+              function(reg, regdata){
+                # get the best linear model setup
+                bestCovs = best[[reg]]
+                # fit sarima and linear models for comparison
+                sfit = fitSarima(regdata, NULL, addAR1=F, covariates=bestCovs, showPlot=FALSE)
+                sarfit = fitSarima(regdata, NULL, addAR1=T, covariates=bestCovs, showPlot=FALSE)
+                lmfit = linmod(form(covariates=bestCovs), data=regdata)
+                # return the fits
+                return(list(linear=lmfit, sarima=sfit, sarimaAR=sarfit))
+              })
 ```
 
 
-## Validate
-
-
-
-# Adding Spatial Term
-
-## Propose
+# Is the addition of AR1 significant
+Using log likelihood ratio test
 ```{r}
-data = hanta
+# arlogratio = listmetric(allfits, function(set, models){
+#     sarima = models$sarima
+#     sarimaAR = models$sarimaAR
+#     
+#     logratio = logRat(sarima, sarimaAR)
+#     
+#     return(c(logratio))
+#   }, columnNames=c("logratio","p value","significant", "region"))
+# arlogratio$significant = as.logical(arlogratio$significant)
+# savetbl(regionRename(arlogratio), tblname="arlogratio")
 
-coords = unique(st_coordinates(data))
-mesh = fm_mesh_2d_inla(loc=coords, crs = st_crs(sweden))
-spde = inla.spde2.matern(mesh=mesh)
 
-# map out all geographical locations we will consider for results i.e. the full map as a dataframe
-plane = fm_pixels(mesh, mask = sweden, format = "sp")
-allgids = blankdf(c(), geom=plane)
-st_crs(allgids) = st_crs(sweden)
-allgids$gid = 1:nrow(allgids)
 
-# make sure this matches the sform
-cmps = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde)
+# change in dic
+ardic = listmetric(allfits, function(set, models){
+    sarima = models$sarima
+    sarimaAR = models$sarimaAR
+    
+    hasImproved = sarimaAR$dic$dic < sarima$dic$dic
 
-sfit = bru(cmps, family="poisson", data=data,
-           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
-                        control.inla = list(int.strategy = "eb"),
-                        verbose = F))
+    
+    return(c(sarima$dic$dic, sarimaAR$dic$dic, hasImproved))
+  }, columnNames=c("sarima", "sarimaAR","improved", "region"))
+ardic$improved = as.logical(ardic$improved)
+savetbl(regionRename(ardic), tblname="ardic")
+```
+
+## Best model per region
+
+```{r results='asis'}
+# select the best covariates and best model for each region
+bestmodelcols = c("region","temperature","humidity","rain","ar1")
+bestmodel = performance(arimprove, locs$GID_1,columns=bestmodelcols, metric=function(reg, data){
+    bestcovs = best[[reg]]
+    row = c(region=reg,
+            temperature = "temperature" %in% bestcovs,
+            humidity = "humidity" %in% bestcovs,
+            rain = "rain" %in% bestcovs,
+            ar1 = T
+            )
+    return(row)
+  })
+bestmodel$ar1 = ardic$improved #as.logical(arlogratio$significant)
+
+bestmodel = select(bestmodel,-region.1)
+
+cache(bestmodel)
+
+# change the symbols to more like tick and cross
+trueVal = "\\ding{52}"
+falseVal = "\\ding{56}"
+
+bestmodel = mutate(bestmodel,
+                   temperature=ifelse(temperature==TRUE, trueVal, falseVal),
+                   humidity=ifelse(humidity==TRUE, trueVal, falseVal),
+                   rain=ifelse(rain==TRUE, trueVal, falseVal),
+                   ar1=ifelse(ar1==TRUE, trueVal, falseVal),
+                   )
+
+# add something to change cell colour based on value
+truefalseColour = function(cell){
+  cellColor = "white" 
+  if(cell == trueVal){
+    cellColor = "teal"
+  }
+  kableExtra::cell_spec(cell, format="latex", escape=FALSE, background=cellColor)
+}
+
+bestmodel = regionRename(bestmodel)
+savetbl(bestmodel, caption="Best model for each region.", cellSpecFunc=truefalseColour)
+```
+
+## Check in on Bahia to see the resultant acf
+```{r}
+regDetails = locs[locs$gid==regionNum,]
+regionID = regDetails$GID_1
+regionName = regDetails$NAME_1
+regionResids = allfits[[regionID]]$sarimaAR$resid
+
+goodacf = ggacf(regionResids)
+goodacf
+
+saveimg(goodacf)
+```
+
+
+# Next iteration, why no need to add spatial term?
+
+All the temporal correlation removed therefore independent.
+
+## Variogram of mean residuals
+```{r}
+# aggregate the residuals over time (mean) per region
+meanResids = t(data.frame(lapply(allfits, FUN=function(reg){
+    mres = mean(reg$sarimaAR$resid)
+    return(mres)
+  })))
+regions$resid = meanResids
+
+# variogram with confidence intervals - the spatial autocorrelation of the mean residuals
+sform = resid~1
+v = ggvario(regions, sform=sform, autofit=FALSE)
+ci = loadOrGenerate("citable", func=function(){
+ return(ggvarioConfidenceIntervals(v$vario, sform=v$sform, sdata=regions, nreps=10000))
+},overwrite = FALSE)
+
+# save the plot  
+sarimavario = v$plt + ci$ribbon
+sarimavario
+saveimg(sarimavario)
+```
+
+
+## ST variogram
+
+```{r}
+# get the residuals from the AR12 model at time
+resids = t(data.frame(lapply(allfits, FUN=function(reg){
+    ratt = reg$sarimaAR$resid
+    return(ratt)
+  })))
+colnames(resids) = paste("t",1:ntimes,sep="_")
+resids = data.frame(resids)
+resids$region = rownames(resids)
+
+# convert to a spatialpointsdataframe
+sregions = as_Spatial(regions)
+sform = resid~1
+
+# calculate variograms per time bag
+bags = ntimes / 12
+bagSize = 12
+varios = list()
+cis = list()
+for(i in 0:(bags-1)){
+  start = 1 + (i*bagSize)
+  end = start + bagSize - 1
   
-hanta$sresid = sfit$residuals$deviance.residuals
+  print(paste(start, end))
+  # the first 1:ntimes columns are the residuals at time t
+  meanResids = rowMeans(resids[start:end])
+  sregions$resid = meanResids
+  
+  # calculate just the variogram data, no plot 
+  vario = variogram(sform, data=sregions)
+  
+  
+  # now calculate the confidence intervals on a per time bag basis
+  ci = ggvarioConfidenceIntervals(vario=vario, 
+                                  sform=sform, 
+                                  sdata=sregions, 
+                                  nreps=10000,
+                                  makeRibbon=FALSE)
+  # add the ci range to the variogram data
+  vario$lb = ci$ci$lb
+  vario$ub = ci$ci$ub
+  
+  # save it
+  varios[[(i+1)]] = vario
+}
 
-sov = loadOrGenerate("soverview", func=function(){
-    stov = stoverview(hanta, form=sresid~1, ciReps=cireps,
-                      spaceCols=scol, timeCols=tcol,
-                      spaceSummaryFunction=mean, timeSummaryFunction=mean)
-    stov$stvario = STvarioplot(hanta, sresid~1, cireps=cireps)
-    return(stov)
-  }, overwrite=overwrite)
-
-spatialacf = sov$acf
-spatialvario = sov$vario
-spatialstvario = sov$stvario
-spatialresids = plotResids(hanta, "sresid")
-
-spatialacf
-spatialvario
-spatialstvario
-spatialresids
-
-saveimg(spatialacf)
-saveimg(spatialvario)
-saveimg(spatialstvario)
-saveimg(spatialresids)
-```
-
-## Fit temporal term(s)
+# plot the variograms
+varios = bind_rows(varios, .id="time")
+varios$time = as.numeric(varios$time)
+varios$sig = rep(0, nrow(varios))
+varios$sig[isOutside(varios$gamma, varios$lb, varios$ub)] = outside(varios$gamma, varios$lb, varios$ub)
 
 
-```{r}
-data = hanta
+# gamma surface
+plot_ly(data=varios, type="mesh3d", x=~time, y=~dist, z=~gamma, 
+        autocolorscale=F, colorscale="Viridis")
 
-lastmonth = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde) + st(ym, model="ar1")
+# ci ranges
+plot_ly(data=varios) %>% 
+  add_mesh(x=~time, y=~dist, z=~gamma) %>%
+  add_mesh(x=~time, y=~dist, z=~lb, color="#FF0251", opacity=.6) %>%
+  add_mesh(x=~time, y=~dist, z=~ub, color="#FA2514", opacity=.6) 
 
-fit = bru(lastmonth, family="poisson", data=data,
-            options=list(control.compute = list(waic = TRUE, cpo = FALSE),
-                         control.inla = list(int.strategy = "eb"),
-                         verbose = F))
+# only significant areas
+plot_ly(data=varios, type="mesh3d", x=~time, y=~dist, z=~sig, 
+        intensity=~sig, autocolorscale=F, colorscale="Hot")
 
-fit$resid = fit$residuals$deviance.residuals
-data$resid = fit$resid
 
-cgrams = loadOrGenerate("stoverview", function(){
-    cgrams = stoverview(data, form=resid~1, ciReps=cireps,
-                    spaceCols=scol, timeCols=tcol,
-                    spaceSummaryFunction=mean, timeSummaryFunction=mean)
-    cgrams$stvario = STvarioplot(data, resid~1, cireps=cireps)
-    return(cgrams)
-}, overwrite=overwrite)
+# 2d 
+plot_ly(data=varios, type="scatter", mode="markers", x=~time, y=~dist, 
+        marker=list(color=~sig,
+                    colorscale="Reds",
+                    colorbar=list(title="Significance")))
 
-stacf = cgrams$acf
-stvario = cgrams$vario
-ststvario = cgrams$stvario
-stresids = plotResids(data, "resid")
 
-stacf
+stvario = plot_ly(data=varios, type="contour", x=~time, y=~dist, z=~sig, colorscale="Jet")
 stvario
-ststvario
-stresids
-
-saveimg(stacf)
 saveimg(stvario)
-saveimg(ststvario)
-saveimg(stresids)
 ```
 
-
-## No interaction term
-
-
-## type 4 interaction - separable kronecker product model
-
-```{r}
-loadOrGenerate("inlapoisST", fitbestmodel(hanta), overwrite=overwrite)
-#stmodelp = decache("inlapoisST")
-
-
-sdata = hanta
-sdata$resid = stmodelp$residuals$deviance.residuals
-
-type4overview = loadOrGenerate("type4overview", function(){
-  stpoverview = stoverview(sdata, resid~1, ciReps=cireps, spaceCols=scols, timeCols=tcols, autofitVario=F,
-           spaceSummaryFunction=mean, timeSummaryFunction=mean)
-  stpoverview$stvario = STvarioplot(hanta, cases~1, cireps=cireps)
-  return(stpoverview)
-},overwrite=overwrite)
-
-
-#STvarioplot(sdata, cireps=cireps)
-stiacf = type4overview$acf
-stivario = type4overview$vario
-stistvario = type4overview$stvario
-stiresid = plotResids(sdata, "resid")
-
-stiacf
-stivario
-stistvario
-stiresid
-
-saveimg(stiacf)
-saveimg(stivario)
-saveimg(stistvario)
-saveimg(stiresid)
-```
-
-
-## increase in spatial variance can be down to single temporal surface, interaction term needed. OR non-separable model
-
-
-
-
-## Validate
-
-
-
-
-# diagnostic matrix - every model have acfUV, vario something, dic, fit?
-
-```{r}
-
-```
-
-
-
-# misc
-```{r}
-# covariate locations
-covs = loadCovariates()
-covlocs = unique(select(covs$data$`hist-nat`, long, lat))
-covlocs$index = 1:nrow(covlocs)
-covsf = tosf(covlocs, coords=c("long","lat"))
-ggplot(covsf) + geom_sf()
-
-# locations from notified data
-ggplot(hanta) + geom_sf()
-# locations of mesh / spde
-plot(mesh)
-# locations for kriging
-coords = unique(st_coordinates(hanta))
-mesh = inla.mesh.2d((loc=coords), crs = st_crs(sweden))
-basemap = fm_pixels(mesh, mask = sweden, format = "sf")
-ggplot(basemap) + geom_sf(size=.25,alpha=0.2)
-
-
-
-
-ggplotly(ggplot() + geom_sf(data=basemap, aes(color="projection")) + geom_sf(data=hanta, aes(color="Cases")) + geom_sf(data=covsf, aes(color="Covariates")) + scale_color_brewer(palette="Pastel1"))
-```
-
-
-```{r}
-# DIC table of all models - all bayesian ones
-dictable = data.frame(
-  Model=c("Initial","Spatial","Spatiotemporal","SpatioTemporal (Type IV)"),
-  DICs=c(lmfit$dic$dic, sfit$dic$dic, fit$dic$dic, stmodelp$dic$dic)
-)
-
-dictable
-
-savetbl(dictable)
-```
 
