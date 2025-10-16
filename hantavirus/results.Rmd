@@ -1,0 +1,293 @@
+---
+title: "results"
+author: "Matt"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+source("../../../utils/R/utils.R")
+install()
+installKaleido(full=F)
+source("./helpers.R")
+
+
+defaultSaveFolder=cacheFolder
+
+library(inlabru)
+#library(raster)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Disease Mapping
+
+
+```{r}
+cireps = 10000
+overwrite = TRUE # regenerate all the slow parts from scratch
+
+# Definitions
+outFolder = "../paperoutputs"
+
+tcols = c("year","month")
+scols = c("long","lat")
+
+model = decache("inlapoisST")
+
+# load the country shape
+sweden = decache("sweden")
+
+# Projection within the same time period across space
+fit126 = decache("pred_ssp126")
+fit245 = decache("pred_ssp245")
+fit585 = decache("pred_ssp585")
+
+# aggregate over time
+s126 = groupSummary(fit126, tcols, c("cases"), summaryFunction=mean)
+s245 = groupSummary(fit245, tcols, c("cases"), summaryFunction=mean)
+s585 = groupSummary(fit585, tcols, c("cases"), summaryFunction=mean)
+
+# aggregate over space
+t126 = groupSummary(dropSF(fit126), scols, c("cases"), summaryFunction=mean)
+t126 = tosf(t126, coords=scols)
+t245 = groupSummary(dropSF(fit245), scols, c("cases"), summaryFunction=mean)
+t245 = tosf(t245, coords=scols)
+t585 = groupSummary(dropSF(fit585), scols, c("cases"), summaryFunction=mean)
+t585 = tosf(t585, coords=scols)
+
+# for projecting over space 
+allcovs = decache("scaledCovariates")
+
+# this should happen earlier in the pipeline
+model$sform = bestformula
+
+# sort and add ym
+s126 = sfinject(s126, uIndex, tcols, "ym")
+s126 = sfinject(s126, sortdf, "ym")
+s245 = sfinject(s245, uIndex, tcols, "ym")
+s245 = sfinject(s245, sortdf, "ym")
+s585 = sfinject(s585, uIndex, tcols, "ym")
+s585 = sfinject(s585, sortdf, "ym")
+```
+
+
+
+
+```{r}
+# kriging
+fit = fit126
+covs = tosf(allcovs$data$ssp126, scols)
+res = c(1024,2048)
+
+firstyearMap126 = sproject(fit, min(fit$year), min(fit$month), min(fit$ym), model, covs, sweden, res)
+lastyearMap126 = sproject(fit, max(fit$year), max(fit$month), max(fit$ym), model, covs, sweden, res)
+#tored in a sf object to a ggplot
+fit = fit245
+covs = tosf(allcovs$data$ssp245, scols)
+firstyearMap245 = sproject(fit, min(fit$year), min(fit$month), min(fit$ym), model, covs, sweden, res)
+lastyearMap245 = sproject(fit, max(fit$year), max(fit$month), max(fit$ym), model, covs, sweden, res)
+
+fit = fit585
+covs = tosf(allcovs$data$ssp585, scols)
+firstyearMap585 = sproject(fit, min(fit$year), min(fit$month), min(fit$ym), model, covs, sweden, res)
+lastyearMap585 = sproject(fit, max(fit$year), max(fit$month), max(fit$ym), model, covs, sweden, res)
+```
+
+```{r}
+regions = st_read("../../Sweden/gadm36_SWE_1.shp")
+regions = st_transform(regions, epsg)
+ggplot(regions) + geom_sf()
+
+municipalities = st_read("../../Sweden/gadm36_SWE_2.shp")
+municipalities = st_transform(municipalities, epsg)
+ggplot(municipalities) + geom_sf()
+```
+
+
+```{r}
+
+makediffmap = function(firstyear, lastyear){
+  firstyearMap = sfinject(firstyear, sortdf, c(tcols,scols))
+  lastyearMap = sfinject(lastyear, sortdf, c(tcols,scols))
+  diffmap = select(firstyearMap, c(long,lat,risk))
+  diffmap$risk = lastyearMap$risk - firstyearMap$risk
+  
+  return(diffmap)
+}
+# risk map
+riskmap = function(firstyear, lastyear, scenario){
+  # sort and get diff map
+  firstyearMap = sfinject(firstyear, sortdf, c(tcols,scols))
+  lastyearMap = sfinject(lastyear, sortdf, c(tcols,scols))
+  diffmap = select(firstyearMap, c(long,lat,risk))
+  diffmap$risk = lastyearMap$risk - firstyearMap$risk
+  
+  # rasterise
+  diffmapRaster = st_rasterize(sf=select(diffmap, risk))[sweden] # cuts leaving NAs
+  
+  # change in risk over 100 years
+  diffplot = ggplot() + 
+    geom_sf(data=sweden, alpha=0) +
+    geom_stars(data=diffmapRaster, aes(fill=risk, alpha=(abs(risk)/max(abs(risk))) ), na.action=na.omit) +
+    scale_fill_gradient2(low="darkgreen", mid="white", high="red") +
+    guides(alpha="none") +
+    labs(risk="Change in Risk") + 
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle(scenario) + 
+    theme_bw()
+  
+  diffplot
+  ggplotly(diffplot) 
+  
+  return(diffplot)
+}
+
+getGroupIds = function(boundaries){
+  n = length(boundaries)
+  zeroAt = (n + 1) / 2
+  groupIds = seq(1,n) - zeroAt
+  # merge the two groups straddling zero to be a zero group
+  isOdd = !zeroAt%%2==0
+  if(isOdd){
+    before = groupIds[1:((zeroAt-.5)-1)]
+    midpoint = 0
+    after = groupIds[((zeroAt+.5)+1):n]
+    groupIds = c(before,midpoint,after)
+  }
+  return(groupIds)
+}
+
+#boundaries includes min and max
+assignGroups = function(values, boundaries){
+  # continuous ids, centered on zero to keep positive and negative
+  groupIds = getGroupIds(boundaries)
+  
+  grouped = rep(groupIds[1],length(values))
+  info("set everything to 1")
+  for(i in 2:(length(boundaries)-1) ){
+      info(paste("set values >= ", boundaries[i], " to group ", groupIds[i]))
+      grouped[values >= boundaries[i]] = groupIds[i]
+  }
+  
+
+  groupfactor = factor()
+  return(grouped)
+}
+groupLabels = function(boundaries){
+  dps = 2
+  overlap = 0
+  n = length(boundaries)
+  zeroAt = (n + 1) / 2
+  
+  labels = c(paste("<", format(boundaries[2]-overlap,digits=dps)))
+
+  for(i in 2:(length(boundaries)-2) ){
+      if(i > zeroAt){
+        overlap = abs(overlap)
+      }
+      labels = c(labels, paste(format(boundaries[i],digits=dps),"->", format(boundaries[i+1]-overlap,digits=dps)))
+  }
+  labels = c(labels, paste(">",format(boundaries[length(boundaries)-1],digits=dps)))
+  return(labels)
+}
+
+riskmapAreal = function(diffmap, scenario, regions, boundaries, limits){
+  # aggregate to the areal regions
+  groupings = within(regions, diffmap$geometry)
+  risk = c()
+  for(group in groupings){
+    vals = diffmap$risk[group]
+    risk = c(risk, mean(vals))
+  }
+  regions$risk = risk
+  regions$riskGroup = assignGroups(regions$risk, boundaries)
+  
+  labels = groupLabels(boundaries)
+  ids = getGroupIds(boundaries)
+  
+  
+  # change in risk over 100 years
+  diffplot = ggplot() + 
+    geom_sf(data=regions, mapping=aes(fill=riskGroup), lwd=0.1) + # , alpha=(abs(risk)/max(abs(risk)))
+    scale_fill_gradient2(low="darkgreen", mid="white", high="red", name="Relative Risk", breaks=ids,
+                         labels=labels) + #, limits=colourlimits
+    #scale_fill_discrete( + 
+    guides(alpha="none") +
+    xlab("Longitude") +
+    ylab("Latitude") +
+    ggtitle(scenario) + 
+    theme_bw()
+  
+  diffplot
+  ggplotly(diffplot) 
+  
+  return(diffplot)
+}
+
+# make the difference datafames to plot - also work out the shared scale
+d126 = makediffmap(firstyearMap126, lastyearMap126)
+d245 = makediffmap(firstyearMap245, lastyearMap245)
+d585 = makediffmap(firstyearMap585, lastyearMap585)
+
+numGroups = 7 # includes min and max
+boundaries = quantile(c(d126$risk,d245$risk,d585$risk), probs=seq(0,1, by=(1/numGroups)))
+
+
+# make and save the diff in relative risk plots over the next century, per region
+riskplt126 = riskmapAreal(d126, "Scenario 126", regions=municipalities, boundaries)
+riskplt126
+saveimg(riskplt126)
+
+riskplt245 = riskmapAreal(d245, "Scenario 245", regions=municipalities, boundaries)
+riskplt245
+saveimg(riskplt245)
+
+riskplt585 = riskmapAreal(d585, "Scenario 585", regions=municipalities, boundaries)
+riskplt585
+saveimg(riskplt585)
+
+# smoothed trend over time (aggregated)
+hantaProjections = ggplot(mapping=aes(x=ym,y=cases)) + 
+  geom_smooth(s126, mapping=aes(color="SSP 126")) + 
+  #geom_line(s126, mapping=aes(color="SSP 126"), alpha=0.52) +
+  geom_smooth(s245, mapping=aes(color="SSP 245")) + 
+  #geom_line(s245, mapping=aes(color="SSP 245"), alpha=0.52) +
+  geom_smooth(s585, mapping=aes(color="SSP 585")) + 
+  #geom_line(s585, mapping=aes(color="SSP 585"), alpha=0.52) + 
+  labs(color="Scenario") +
+  theme_bw()
+hantaProjections = dateAxis(s126, hantaProjections, format="%Y", each=10)
+ggplotly(hantaProjections)
+
+saveimg(hantaProjections)
+```
+
+
+
+```{r}
+ggplot(data=covs$data$ssp126, mapping=aes(x=time)) + 
+  geom_line(aes(y=huss, color="humidity"), alpha=0.25) +
+  geom_line(aes(y=tas, color="temperature"), alpha=0.25) +
+  geom_line(aes(y=pr, color="rain"), alpha=0.25) +
+  geom_line(aes(y=prsn, color="snowflux"), alpha=0.25) +
+  theme_bw()
+
+ggplot(data=covs$data$ssp245, mapping=aes(x=time)) + 
+  geom_line(aes(y=huss, color="humidity"), alpha=0.25) +
+  geom_line(aes(y=tas, color="temperature"), alpha=0.25) +
+  geom_line(aes(y=pr, color="rain"), alpha=0.25) +
+  geom_line(aes(y=prsn, color="snowflux"), alpha=0.25) +
+  theme_bw()
+
+ggplot(data=covs$data$ssp585, mapping=aes(x=time)) + 
+  geom_line(aes(y=huss, color="humidity"), alpha=0.25) +
+  geom_line(aes(y=tas, color="temperature"), alpha=0.25) +
+  geom_line(aes(y=pr, color="rain"), alpha=0.25) +
+  geom_line(aes(y=prsn, color="snowflux"), alpha=0.25) +
+  theme_bw()
+```
+

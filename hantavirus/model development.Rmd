@@ -1,0 +1,518 @@
+---
+title: "model development"
+author: "Matt"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+source("../../../utils/R/utils.R")
+install()
+installKaleido()
+source("helpers.R")
+
+
+library(inlabru)
+isTRUE(getOption("knitr.in.progress"))
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Preliminary Factors
+
+```{r}
+m = options()
+cireps = 10000
+overwrite = FALSE # regenerate all the slow parts from scratch
+defaultSaveFolder=cacheFolder # covariates will save to cache
+
+# Definitions
+dataFolder = "../data"
+swedenFolder = "../../Sweden"
+outFolder = "../paperoutputs"
+
+tcols = c("year","month")
+scols = c("long","lat")
+tcol = c("ym")
+scol = c("gid")
+# model covariates
+covariates = c("temperature", "snowflux", "humidity", "rain")
+
+# load the data
+hanta = read.csv(path("clean", folder=dataFolder, extension=".csv"))[,-1]
+sweden = decache("sweden")
+
+# basic metrics - NOT SPARSE
+ntimes = nrow(unique(select(hanta, all_of(tcols))))
+nlocs = nrow(unique(select(hanta, all_of(scols))))
+
+# augment the data - move this to the preprocess script
+hanta = uIndex(hanta, tcols, newColName="ym")
+hanta = uIndex(hanta, scols, newColName="gid")
+
+# make iuIndex()# make into a simple feature
+hanta = tosf(hanta, coords=scols)
+
+# add in lat long too
+coords = st_coordinates(hanta)
+hanta$long = coords[,1]
+hanta$lat = coords[,2]
+
+
+# to avoid changing the original data, take a copy that is ordered by time then space
+copy = function(df){
+  dfcopy = NULL
+  sortkey = c(tcols,scols)
+  if("sf" %in% class(df)){
+    dfcopy = sfinject(df, sortdf, sortkey)
+  } else{
+    dfcopy = sortdf(df, sortkey)
+  }
+  return(dfcopy)
+}
+
+# call this to refresh the sorting on the hanta data
+hantasort = function(){
+  sortkey = c(tcols,scols)
+  if("sf" %in% class(hanta)){
+    hanta <<- sfinject(hanta, sortdf, sortkey)
+  } else{
+    hanta <<- sortdf(hanta, sortkey)
+  }
+}
+hantasort()
+```
+
+## EDA
+
+```{r}
+o = overview(sfsuspend(hanta))
+```
+
+```{r}
+shanta = groupSummary(hanta, groupBy = scols, summariseBy = c(covariates, "cases"))
+thanta = groupSummary(hanta, groupBy = c(tcols,tcol), summariseBy = c(covariates, "cases"))
+
+years = unique(thanta$year)
+casestime = ggplot(thanta) +
+  geom_line(aes(x=ym, y=cases), color="steelblue3") +
+  scale_x_continuous(breaks=seq(1,(max(thanta$ym)),by=12), labels=as.character(unique(thanta$year))) +
+  xlab("date") +
+  theme_bw()
+
+casesspace = ggplot(sweden) + 
+  geom_sf() +
+  geom_point(aes(x=long, y=lat, colour=cases, size=log(cases)), alpha=0.5, data=shanta) +
+  theme_bw() 
+
+casestime
+casesspace
+
+saveimg(plt=casestime)
+saveimg(plt=casesspace)
+```
+
+```{r}
+# Here space and time datasets are summarised by sum. Mean will be used for residuals
+casov = loadOrGenerate("casesOverview", func=function(){
+    sto = stoverview(hanta, spaceCols=scol, timeCols=tcol, ciReps=cireps)
+    sto$stvario = STvarioplot(hanta, cases~1, cireps=cireps)
+    return(sto)
+  }, overwrite=overwrite)
+
+casesvario = casov$vario
+casesacf = casov$acf
+casesstvario = casov$stvario
+
+casesvario
+casesacf
+casesstvario
+
+saveimg(casesvario)
+saveimg(casesacf)
+saveimg(casesstvario)
+
+# casesstvario
+```
+
+
+## Covariate selection
+
+
+```{r}
+combinations = comboList(c("temperature","humidity","rain","snowflux"))
+comboString = comboListStrings(combinations)
+
+splitAt = firstGTE(hanta, "year", 2015) - 1
+split = splitdf(dropSF(hanta), splitAt)
+
+perfstat = c()
+for(covs in combinations){
+  print(covs)
+  # make the formula up for each combination of covariates
+  hascovs = sum(covs != "") > 0
+  #print(hascovs)
+  lmformula = cases~Intercept(1)
+  
+  if(hascovs){
+    lmformula = form(covariates=c("Intercept(1)",covs))
+  }
+  
+  #print(lmformula)
+  lmfit = bru(lmformula, family="poisson", data=split$before,
+         options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                      control.inla = list(int.strategy = "eb"),
+                      verbose = F))
+  
+  preds = exp(predict(lmfit, newdata=split$after, formula=baseform(lmformula), n.samples=1000)$mean)
+  print(ggplotly(ggplot() +
+    #geom_line(data=split$before, mapping=aes(x=1:splitAt,y=cases,colour="before")) +
+    geom_line(data=split$after, mapping=aes(x=(splitAt+1):nrow(hanta),y=cases,colour="after")) +
+    geom_line(mapping=aes(x=(splitAt+1):nrow(hanta),y=preds,colour="predicted")) +
+    theme_bw()))
+  
+  # dpois - gen cases
+
+  
+  # measure the performance - rmse
+  actual = split$after$cases
+  err = actual - preds
+  rmse = sqrt(mean(err*err))
+  
+  # or use variogram
+  perfstat = c(perfstat, rmse)
+}
+
+covpredperf = data.frame("covariates"=comboString, "RMSE"=perfstat)
+savetbl(covpredperf, caption="RMSE for each covariate combination when projecting 2016 onwards")
+```
+
+
+
+# Initial Model - covariates only
+
+
+## Propose
+
+```{r}
+initial = form(covariates=covariates)
+lmfit = bru(initial, family="poisson", data=copy(hanta),
+           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                        control.inla = list(int.strategy = "eb"),
+                        verbose = F))
+
+summary(lmfit)
+```
+
+```{r}
+hanta$lmresid = getModelResiduals(lmfit)
+
+lmresidO = loadOrGenerate("lmoverview", func=function(){
+    stov = stoverview(hanta, form=lmresid~1, ciReps=cireps, 
+                      spaceCols=scol, timeCols=tcol,
+                      spaceSummaryFunction=mean, timeSummaryFunction=mean)
+    stov$stvario = STvarioplot(hanta, lmresid~1, cireps=cireps)
+    return(stov)
+  }, overwrite=overwrite)
+
+lmvario = lmresidO$vario
+lmacf = lmresidO$acf
+lmstvario = lmresidO$stvario
+lmresid = plotResids(hanta, "lmresid")
+
+lmvario
+lmacf
+lmstvario
+lmresid
+
+saveimg(lmvario)
+saveimg(lmacf)
+saveimg(lmstvario)
+saveimg(lmresid)
+```
+
+
+## Fit - try time only first, see if spatial autocorrelation emerges
+```{r}
+# data = hanta
+# temporal = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + st(ym, model="ar1") + S(geometry, model=spde)
+# results = testfit(hanta, temporal)
+# 
+# results$acf
+# results$vario
+# 
+# data$resid = results$fit$resid
+# STvarioplot(data, sform=resid~1, cireps = 100)
+```
+
+
+## Validate
+
+
+
+# Adding Spatial Term
+
+## Propose
+```{r}
+data = hanta
+
+coords = unique(st_coordinates(data))
+mesh = fm_mesh_2d_inla(loc=coords, crs = st_crs(sweden))
+spde = inla.spde2.matern(mesh=mesh)
+
+# map out all geographical locations we will consider for results i.e. the full map as a dataframe
+plane = fm_pixels(mesh, mask = sweden, format = "sp")
+allgids = blankdf(c(), geom=plane)
+st_crs(allgids) = st_crs(sweden)
+allgids$gid = 1:nrow(allgids)
+
+# make sure this matches the sform
+cmps = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde)
+
+sfit = bru(cmps, family="poisson", data=data,
+           options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                        control.inla = list(int.strategy = "eb"),
+                        verbose = F))
+  
+hanta$sresid = sfit$residuals$deviance.residuals
+
+sov = loadOrGenerate("soverview", func=function(){
+    stov = stoverview(hanta, form=sresid~1, ciReps=cireps,
+                      spaceCols=scol, timeCols=tcol,
+                      spaceSummaryFunction=mean, timeSummaryFunction=mean)
+    stov$stvario = STvarioplot(hanta, sresid~1, cireps=cireps)
+    return(stov)
+  }, overwrite=overwrite)
+
+spatialacf = sov$acf
+spatialvario = sov$vario
+spatialstvario = sov$stvario
+spatialresids = plotResids(hanta, "sresid")
+
+spatialacf
+spatialvario
+spatialstvario
+spatialresids
+
+saveimg(spatialacf)
+saveimg(spatialvario)
+saveimg(spatialstvario)
+saveimg(spatialresids)
+```
+
+```{r}
+# annual = seq(0,max(thanta$ym), by=12)
+# thanta$date = as.Date(paste(thanta$year,thanta$month,1,sep="-"))
+# ggplotly(ggplot(thanta, aes(x=date, y=cases)) + 
+#   geom_line(color="steelblue") + 
+#   theme_bw() +
+#   scale_x_date(date_breaks = "1 months", date_labels = "%b-%Y") + 
+#   theme(axis.text.x=element_text(angle=45, hjust=1))
+# )
+```
+
+
+## Fit temporal term(s)
+
+```{r}
+# 
+# lastmonth = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde) + st(ym, model="ar", order=1)
+# 
+# firstpeak = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde) + st(ym, model="ar", order=3)
+# 
+# volecycle = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde) + st(ym, model="ar", order=4)
+# 
+# 
+# 
+# 
+# testfit(hanta, lastmonth)
+# testfit(hanta, firstpeak)
+# testfit(hanta, volecycle)
+# #very slow - cached
+# #stmodelg = testfit(hanta, stmodel, family="gaussian")
+# #cache(stmodelg, "inlagaussianST")
+# #stmodelg = decache("inlagaussianST")
+# 
+# 
+# 
+# 
+# # simple interaction terms
+# hanta$ymgid = 1:nrow(hanta)
+# type3 = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + V(geometry, model=spde) + U(ym, model="ar", order=1) + M(ymgid, model="iid")
+# fit = testfit(hanta, type3, ciReps=100)
+# fit$acf
+# fit$vario
+# data$resid = fit$fit$resid
+# STvarioplot(data, sform=resid~1, cireps=100)
+```
+
+```{r}
+data = hanta
+
+lastmonth = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde) + st(ym, model="ar1")
+
+fit = bru(lastmonth, family="poisson", data=data,
+            options=list(control.compute = list(waic = TRUE, cpo = FALSE),
+                         control.inla = list(int.strategy = "eb"),
+                         verbose = F))
+
+  fit$resid = fit$residuals$deviance.residuals
+  data$resid = fit$resid
+
+  cgrams = loadOrGenerate("stoverview", function(){
+      cgrams = stoverview(data, form=resid~1, ciReps=cireps,
+                      spaceCols=scol, timeCols=tcol,
+                      spaceSummaryFunction=mean, timeSummaryFunction=mean)
+      cgrams$stvario = STvarioplot(data, resid~1, cireps=cireps)
+      return(cgrams)
+  }, overwrite=overwrite)
+  
+  stacf = cgrams$acf
+  stvario = cgrams$vario
+  ststvario = cgrams$stvario
+  stresids = plotResids(data, "resid")
+  
+  stacf
+  stvario
+  ststvario
+  stresids
+  
+  saveimg(stacf)
+  saveimg(stvario)
+  saveimg(ststvario)
+  saveimg(stresids)
+```
+
+
+## No interaction term
+```{r}
+# stzero = testfit(hanta, lastmonth)
+# stzerodata = hanta
+# stzerodata$resid = stzero$fit$resid
+# 
+# stzero$acf
+# stzero$vario
+# STvarioplot(stzerodata, cireps=100)
+```
+
+
+## type 4 interaction - separable kronecker product model
+
+```{r}
+# spatial evolves with ar1 pattern/function    separable
+#stmodel = cases ~ Intercept(1) + humidity + rain + temperature + snowflux + S(geometry, model=spde, group=ym, control.group=list(model="ar1"))
+
+# try with poisson
+#bestfit = fitbestmodel(data=hanta)
+#cache(bestfit, filename="inlapoisST")
+
+stmodelp = decache("inlapoisST")
+sdata = hanta
+sdata$resid = stmodelp$residuals$deviance.residuals
+
+type4overview = loadOrGenerate("type4overview", function(){
+  stpoverview = stoverview(sdata, resid~1, ciReps=cireps, spaceCols=scols, timeCols=tcols, autofitVario=F,
+           spaceSummaryFunction=mean, timeSummaryFunction=mean)
+  stpoverview$stvario = STvarioplot(hanta, cases~1, cireps=cireps)
+  return(stpoverview)
+},overwrite=overwrite)
+
+
+#Tvarioplot(sdata, cireps=cireps)
+stiacf = type4overview$acf
+stivario = type4overview$vario
+stistvario = type4overview$stvario
+stiresid = plotResids(sdata, "resid")
+
+stiacf
+stivario
+stistvario
+stiresid
+
+saveimg(stiacf)
+saveimg(stivario)
+saveimg(stistvario)
+saveimg(stiresid)
+```
+
+
+## increase in spatial variance can be down to single temporal surface, interaction term needed. OR non-separable model
+
+
+
+```{r}
+# data = hanta
+# stfit = loadOrGenerate("fittedmodel", func=fitbestmodel, hanta)
+# hanta$stresid = stfit$residuals$deviance.residuals
+# 
+# 
+# stov = loadOrGenerate("stoverview", func=function(){
+#     stov = stoverview(hanta, form=stresid~1, ciReps=cireps, 
+#                       spaceCols=scol, timeCols=tcol,
+#                       spaceSummaryFunction=mean, timeSummaryFunction=mean)
+#     return(stov)
+#   }, overwrite=overwrite)
+# 
+# stov
+```
+
+## Validate
+
+
+
+
+# diagnostic matrix - every model have acfUV, vario something, dic, fit?
+
+```{r}
+
+```
+
+
+
+
+
+```{r}
+# log ratio to check for significant improvement
+```
+
+
+
+
+
+# misc
+```{r}
+# covariate locations
+covs = loadCovariates()
+covlocs = unique(select(covs$data$`hist-nat`, long, lat))
+covlocs$index = 1:nrow(covlocs)
+covsf = tosf(covlocs, coords=c("long","lat"))
+ggplot(covsf) + geom_sf()
+
+# locations from notified data
+ggplot(hanta) + geom_sf()
+# locations of mesh / spde
+plot(mesh)
+# locations for kriging
+coords = unique(st_coordinates(hanta))
+mesh = inla.mesh.2d((loc=coords), crs = st_crs(sweden))
+basemap = fm_pixels(mesh, mask = sweden, format = "sf")
+ggplot(basemap) + geom_sf(size=.25,alpha=0.2)
+
+
+
+
+ggplotly(ggplot() + geom_sf(data=basemap, aes(color="projection")) + geom_sf(data=hanta, aes(color="Cases")) + geom_sf(data=covsf, aes(color="Covariates")) + scale_color_brewer(palette="Pastel1"))
+```
+
+
+```{r}
+# DIC table of all models - all bayesian ones
+dictable = data.frame(
+  Model=c("Initial","Spatial","Spatiotemporal","SpatioTemporal (Type IV)"),
+  DICs=c(lmfit$dic$dic, sfit$dic$dic, fit$dic$dic, stmodelp$dic$dic)
+)
+
+dictable
+
+savetbl(dictable)
+```
+
