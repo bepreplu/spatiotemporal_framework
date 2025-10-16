@@ -8,3 +8,8 @@ model development.Rmd - The markdown file begins with some exploratory data anal
 modelScenario.R - Uses the developed model to make projections on a per climate scenario basis.
 
 results.Rmd - Examine the projections and present them in a number of ways. Primarily as risk maps.
+
+
+
+Additional files:
+helpers.R - code that is shared between the above scripts
